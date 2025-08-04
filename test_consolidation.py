@@ -70,7 +70,12 @@ def test_consolidation():
         consolidator = DatasetConsolidator(str(test_dir), temp_output)
         
         # Run pipeline with minimal processing
-        splits = consolidator.run_pipeline(max_workers=1, create_variants=False)
+        splits = consolidator.run_pipeline(
+            max_workers=1,
+            create_variants=False,
+            shard_size=1,
+            output_formats=("jsonl", "arrow"),
+        )
         
         print(f"\nTest Results:")
         print(f"Total entries: {sum(len(entries) for entries in splits.values())}")
@@ -88,7 +93,7 @@ def test_consolidation():
             print(f"Language: {sample.language}")
         
         # Check output files
-        output_files = list(Path(temp_output).glob("*.jsonl"))
+        output_files = list(Path(temp_output).glob("*"))
         print(f"\nOutput files created: {[f.name for f in output_files]}")
         
         # Clean up test data

@@ -820,8 +820,93 @@ class DatasetConsolidator:
             json.dump(manifest, f, indent=2)
         
         logger.info(f"Saved manifest to {self.output_dir / 'manifest.json'}")
+
+    def save_consolidated_data_v2(
+        self,
+        splits: Dict[str, List[UnifiedSchema]],
+        shard_size: int = 0,
+        output_formats: Tuple[str, ...] = ("jsonl",),
+    ) -> None:
+        """Enhanced saver with optional sharding and Arrow output."""
+
+        logger.info("Saving consolidated data (v2)...")
+
+        import pyarrow as pa
+        import pyarrow.feather as feather
+
+        manifest = {
+            "total_entries": sum(len(entries) for entries in splits.values()),
+            "split_sizes": {name: len(entries) for name, entries in splits.items()},
+            "source_distribution": {},
+            "difficulty_distribution": {},
+            "question_type_distribution": {},
+            "shards": {},
+            "output_formats": list(output_formats),
+        }
+
+        for split_name, entries in splits.items():
+            manifest["shards"][split_name] = {}
+            rows = []
+            for e in entries:
+                row = asdict(e)
+                for k, v in row.items():
+                    if isinstance(v, (list, dict)):
+                        row[k] = json.dumps(v, ensure_ascii=False)
+                rows.append(row)
+
+            if "jsonl" in output_formats:
+                jsonl_shards = []
+                if shard_size and len(rows) > shard_size:
+                    for idx in range(0, len(rows), shard_size):
+                        shard_rows = rows[idx : idx + shard_size]
+                        shard_file = self.output_dir / f"{split_name}_{idx // shard_size:03d}.jsonl"
+                        with open(shard_file, "w", encoding="utf-8") as f:
+                            for row in shard_rows:
+                                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                        jsonl_shards.append(str(shard_file))
+                else:
+                    shard_file = self.output_dir / f"{split_name}.jsonl"
+                    with open(shard_file, "w", encoding="utf-8") as f:
+                        for row in rows:
+                            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    jsonl_shards.append(str(shard_file))
+                manifest["shards"][split_name]["jsonl"] = jsonl_shards
+                logger.info(f"Saved {len(rows)} entries to {jsonl_shards}")
+
+            if "arrow" in output_formats:
+                arrow_shards = []
+                table = pa.Table.from_pandas(pd.DataFrame(rows))
+                num_rows = table.num_rows
+                if shard_size and num_rows > shard_size:
+                    for idx in range(0, num_rows, shard_size):
+                        shard_table = table.slice(idx, shard_size)
+                        shard_file = self.output_dir / f"{split_name}_{idx // shard_size:03d}.arrow"
+                        feather.write_feather(shard_table, shard_file)
+                        arrow_shards.append(str(shard_file))
+                else:
+                    shard_file = self.output_dir / f"{split_name}.arrow"
+                    feather.write_feather(table, shard_file)
+                    arrow_shards.append(str(shard_file))
+                manifest["shards"][split_name]["arrow"] = arrow_shards
+                logger.info(f"Saved Arrow data to {arrow_shards}")
+
+            for entry in entries:
+                manifest["source_distribution"][entry.source_site] = manifest["source_distribution"].get(entry.source_site, 0) + 1
+                manifest["difficulty_distribution"][entry.difficulty] = manifest["difficulty_distribution"].get(entry.difficulty, 0) + 1
+                manifest["question_type_distribution"][entry.question_type] = manifest["question_type_distribution"].get(entry.question_type, 0) + 1
+
+        with open(self.output_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f, indent=2)
+
+        logger.info(f"Saved manifest to {self.output_dir / 'manifest.json'}")
     
-    def run_pipeline(self, max_workers: int = 4, create_variants: bool = True) -> Dict[str, List[UnifiedSchema]]:
+    def run_pipeline(
+        self,
+        max_workers: int = 4,
+        create_variants: bool = True,
+        shard_size: int = 0,
+        output_formats: Tuple[str, ...] = ("jsonl",),
+    ) -> Dict[str, List[UnifiedSchema]]:
         """Run the complete consolidation pipeline"""
         logger.info("Starting dataset consolidation pipeline...")
         
@@ -840,10 +925,10 @@ class DatasetConsolidator:
         
         # Step 5: Create splits
         splits = self.create_train_val_test_splits()
-        
+
         # Step 6: Save data
-        self.save_consolidated_data(splits)
-        
+        self.save_consolidated_data_v2(splits, shard_size=shard_size, output_formats=output_formats)
+
         logger.info("Dataset consolidation pipeline completed successfully!")
         return splits
 
