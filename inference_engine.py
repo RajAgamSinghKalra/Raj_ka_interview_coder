@@ -15,7 +15,8 @@ import torch
 import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, TextIteratorStreamer
+import threading
 from peft import PeftModel
 import onnxruntime as ort
 import numpy as np
@@ -42,6 +43,10 @@ class InferenceConfig:
     # DirectML settings
     use_directml: bool = True
     mixed_precision: bool = True
+
+    # Quantisation settings
+    load_in_8bit: bool = False
+    load_in_4bit: bool = False
     
     # Performance settings
     max_new_tokens: int = 512
@@ -94,13 +99,24 @@ class DirectMLInferenceEngine:
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         
+        # Configure quantisation if requested
+        bnb_config = None
+        if self.config.load_in_8bit or self.config.load_in_4bit:
+            bnb_config = BitsAndBytesConfig(
+                load_in_8bit=self.config.load_in_8bit,
+                load_in_4bit=self.config.load_in_4bit,
+            )
+
         # Load base model
         model = AutoModelForCausalLM.from_pretrained(
             self.config.model_path,
             torch_dtype=torch.float16 if self.config.mixed_precision else torch.float32,
             device_map='auto' if not self.config.use_directml else None,
             low_cpu_mem_usage=True,
-            use_cache=self.config.use_cache
+            use_cache=self.config.use_cache,
+            quantization_config=bnb_config,
+            load_in_8bit=self.config.load_in_8bit if not bnb_config else None,
+            load_in_4bit=self.config.load_in_4bit if not bnb_config else None,
         )
         
         # Move to device if not using device_map
@@ -179,8 +195,49 @@ class DirectMLInferenceEngine:
         response = generated_text[len(formatted_input):].strip()
         
         logger.debug(f"Generation time: {generation_time:.2f}s")
-        
+
         return response
+
+    def stream_generate_response(self, question: str, max_new_tokens: Optional[int] = None):
+        """Stream tokens as they are generated"""
+        if max_new_tokens is None:
+            max_new_tokens = self.config.max_new_tokens
+
+        formatted_input = self._format_input(question)
+
+        inputs = self.tokenizer(
+            formatted_input,
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.config.max_length - max_new_tokens,
+            padding=True
+        )
+
+        if self.config.use_directml:
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
+
+        generation_kwargs = dict(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            temperature=self.config.temperature,
+            top_p=self.config.top_p,
+            top_k=self.config.top_k,
+            repetition_penalty=self.config.repetition_penalty,
+            do_sample=self.config.do_sample,
+            num_return_sequences=1,
+            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+            streamer=streamer,
+            use_cache=self.config.use_cache,
+        )
+
+        thread = threading.Thread(target=self.model.generate, kwargs=generation_kwargs)
+        thread.start()
+        for new_text in streamer:
+            yield new_text
+        thread.join()
     
     def _format_input(self, question: str) -> str:
         """Format the input for the model"""
@@ -258,7 +315,9 @@ def create_inference_config(model_path: str = "fine_tuned_model") -> InferenceCo
             model_path=model_path,
             max_length=saved_config.get('max_length', 2048),
             use_directml=saved_config.get('use_directml', True),
-            mixed_precision=saved_config.get('mixed_precision', True)
+            mixed_precision=saved_config.get('mixed_precision', True),
+            load_in_8bit=saved_config.get('load_in_8bit', False),
+            load_in_4bit=saved_config.get('load_in_4bit', False),
         )
     else:
         config = InferenceConfig(model_path=model_path)

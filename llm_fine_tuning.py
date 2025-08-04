@@ -19,7 +19,8 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from transformers import (
     AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer,
-    DataCollatorForLanguageModeling, EarlyStoppingCallback
+    DataCollatorForLanguageModeling, EarlyStoppingCallback,
+    BitsAndBytesConfig
 )
 from peft import LoraConfig, get_peft_model, TaskType
 import onnxruntime as ort
@@ -37,21 +38,25 @@ class FineTuningConfig:
     """Configuration for fine-tuning"""
     # Model settings
     model_name: str = "microsoft/DialoGPT-medium"  # Lightweight model for testing
-    max_length: int = 2048
+    max_length: int = 4096
     batch_size: int = 2  # Conservative for DirectML
     gradient_accumulation_steps: int = 4
-    
+
     # Training settings
     learning_rate: float = 2e-5
     num_epochs: int = 3
     warmup_steps: int = 100
     weight_decay: float = 0.01
-    
+
     # LoRA settings
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.1
-    
+
+    # Quantisation settings
+    load_in_8bit: bool = False
+    load_in_4bit: bool = False
+
     # DirectML settings
     use_directml: bool = True
     mixed_precision: bool = True
@@ -240,12 +245,23 @@ def load_model_and_tokenizer(config: FineTuningConfig, device):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
+    # Configure quantisation if requested
+    bnb_config = None
+    if config.load_in_8bit or config.load_in_4bit:
+        bnb_config = BitsAndBytesConfig(
+            load_in_8bit=config.load_in_8bit,
+            load_in_4bit=config.load_in_4bit,
+        )
+
     # Load model
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
         torch_dtype=torch.float16 if config.mixed_precision else torch.float32,
         device_map='auto' if not config.use_directml else None,
-        low_cpu_mem_usage=True
+        low_cpu_mem_usage=True,
+        quantization_config=bnb_config,
+        load_in_8bit=config.load_in_8bit if not bnb_config else None,
+        load_in_4bit=config.load_in_4bit if not bnb_config else None,
     )
     
     # Move to device if not using device_map

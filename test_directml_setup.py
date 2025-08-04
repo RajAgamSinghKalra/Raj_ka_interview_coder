@@ -4,9 +4,10 @@ Test DirectML Setup for AMD RX 6800 XT
 Simple verification that DirectML is working correctly
 """
 
-import torch
-import onnxruntime as ort
-import sys
+import pytest
+
+torch = pytest.importorskip('torch')
+onnxruntime = pytest.importorskip('onnxruntime')
 
 def test_directml_setup():
     """Test DirectML setup and compatibility"""
@@ -21,7 +22,7 @@ def test_directml_setup():
     
     # Test 2: ONNX Runtime providers
     print(f"\n2. ONNX Runtime Providers:")
-    providers = ort.get_available_providers()
+    providers = onnxruntime.get_available_providers()
     for provider in providers:
         print(f"   - {provider}")
     
@@ -40,7 +41,7 @@ def test_directml_setup():
             b = np.random.randn(100, 100).astype(np.float32)
             
             # Test with DirectML
-            session = ort.InferenceSession(
+            session = onnxruntime.InferenceSession(
                 None, 
                 providers=['DmlExecutionProvider', 'CPUExecutionProvider']
             )
