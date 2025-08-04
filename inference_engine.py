@@ -51,6 +51,7 @@ class InferenceConfig:
     # Performance settings
     max_new_tokens: int = 512
     use_cache: bool = True
+    lazy_load: bool = True
 
 class DirectMLInferenceEngine:
     """Inference engine optimized for DirectML on AMD GPUs"""
@@ -107,19 +108,23 @@ class DirectMLInferenceEngine:
                 load_in_4bit=self.config.load_in_4bit,
             )
 
-        # Load base model
+        # Determine device map for lazy loading
+        device_map = 'auto' if self.config.lazy_load else None
+        if self.config.use_directml and device_map is None:
+            device_map = None  # load on CPU then move
+
         model = AutoModelForCausalLM.from_pretrained(
             self.config.model_path,
             torch_dtype=torch.float16 if self.config.mixed_precision else torch.float32,
-            device_map='auto' if not self.config.use_directml else None,
-            low_cpu_mem_usage=True,
+            device_map=device_map,
+            low_cpu_mem_usage=self.config.lazy_load,
             use_cache=self.config.use_cache,
             quantization_config=bnb_config,
             load_in_8bit=self.config.load_in_8bit if not bnb_config else None,
             load_in_4bit=self.config.load_in_4bit if not bnb_config else None,
         )
-        
-        # Move to device if not using device_map
+
+        # Move to device if needed
         if self.config.use_directml:
             model = model.to(self.device)
         
@@ -185,16 +190,21 @@ class DirectMLInferenceEngine:
                 eos_token_id=self.tokenizer.eos_token_id,
                 use_cache=self.config.use_cache
             )
-        
+
         generation_time = time.time() - start_time
-        
+        total_tokens = outputs.shape[-1]
+        generated_tokens = total_tokens - inputs['input_ids'].shape[-1]
+        tps = generated_tokens / generation_time if generation_time > 0 else float('inf')
+
         # Decode
         generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
+
         # Extract only the generated part
         response = generated_text[len(formatted_input):].strip()
-        
-        logger.debug(f"Generation time: {generation_time:.2f}s")
+
+        logger.debug(
+            f"Generation time: {generation_time:.2f}s, throughput: {tps:.2f} tokens/s"
+        )
 
         return response
 

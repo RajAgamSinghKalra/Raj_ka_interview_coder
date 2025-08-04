@@ -35,6 +35,7 @@ from tqdm import tqdm
 import pickle
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
+from difflib import SequenceMatcher
 try:
     import html2text
 except ImportError:
@@ -471,7 +472,12 @@ class DatasetConsolidator:
             try:
                 # Map fields based on source
                 mapped_data = self._map_schema_fields(item, source_site)
-                
+
+                # Clean text fields
+                for field in ['question_text', 'answer_text', 'solution_code']:
+                    if field in mapped_data and isinstance(mapped_data[field], str):
+                        mapped_data[field] = self._clean_text(mapped_data[field])
+
                 # Create unified schema entry
                 unified_entry = UnifiedSchema(
                     question_text=mapped_data.get('question_text', ''),
@@ -489,7 +495,7 @@ class DatasetConsolidator:
                     time_limit=mapped_data.get('time_limit'),
                     memory_limit=mapped_data.get('memory_limit')
                 )
-                
+
                 # Clean and validate
                 if self._validate_entry(unified_entry):
                     normalized_entries.append(unified_entry)
@@ -625,27 +631,70 @@ class DatasetConsolidator:
         # Remove entries that are too short or too long
         if len(entry.question_text) < 20 or len(entry.question_text) > 50000:
             return False
-        
-        return True 
+
+        return True
+
+    def _clean_text(self, text: str) -> str:
+        """Normalize text encoding, strip HTML/Markdown and collapse whitespace."""
+        if not text:
+            return ""
+
+        # Ensure utf-8 encoding
+        if not isinstance(text, str):
+            text = str(text)
+        text = text.encode("utf-8", "ignore").decode("utf-8", "ignore")
+
+        # Convert HTML to plain text if needed
+        if "<" in text and ">" in text:
+            try:
+                if html2text:
+                    text = html2text.html2text(text)
+                else:
+                    text = BeautifulSoup(text, "html.parser").get_text()
+            except Exception:
+                pass
+
+        # Remove fenced code blocks from markdown
+        text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+        # Remove remaining markdown formatting characters
+        text = re.sub(r"[#*_>`]+", " ", text)
+
+        # Normalize whitespace
+        text = text.replace("\r", "\n")
+        text = re.sub(r"\s+", " ", text)
+
+        return text.strip()
     
-    def deduplicate_data(self) -> List[UnifiedSchema]:
+    def deduplicate_data(self, fuzzy_threshold: float = 1.0) -> List[UnifiedSchema]:
         """Remove duplicate entries based on question text similarity"""
         logger.info("Starting deduplication...")
-        
-        # Create hash-based deduplication
+
         seen_hashes = set()
-        unique_entries = []
-        
+        unique_entries: List[UnifiedSchema] = []
+
         for entry in tqdm(self.consolidated_data, desc="Deduplicating"):
-            # Create hash of normalized question text
             normalized_text = self._normalize_text(entry.question_text)
             text_hash = hashlib.md5(normalized_text.encode()).hexdigest()
-            
-            if text_hash not in seen_hashes:
+
+            is_duplicate = False
+            if text_hash in seen_hashes:
+                is_duplicate = True
+            elif fuzzy_threshold < 1.0:
+                for existing in unique_entries:
+                    ratio = SequenceMatcher(
+                        None, normalized_text, self._normalize_text(existing.question_text)
+                    ).ratio()
+                    if ratio >= fuzzy_threshold:
+                        is_duplicate = True
+                        break
+
+            if not is_duplicate:
                 seen_hashes.add(text_hash)
                 unique_entries.append(entry)
-        
-        logger.info(f"Deduplication complete: {len(self.consolidated_data)} -> {len(unique_entries)} entries")
+
+        logger.info(
+            f"Deduplication complete: {len(self.consolidated_data)} -> {len(unique_entries)} entries"
+        )
         self.consolidated_data = unique_entries
         return unique_entries
     
@@ -715,22 +764,64 @@ class DatasetConsolidator:
             return max(solutions, key=len).strip()
         
         return solution_code.strip()
+
+    def _transpile_code(self, code: str, source_lang: str, target_lang: str) -> str:
+        """Deterministically transpile code between languages when possible."""
+        source_lang = source_lang.lower()
+        target_lang = target_lang.lower()
+
+        if source_lang == target_lang:
+            return code
+
+        if source_lang == "python" and target_lang in {"cpp", "java", "javascript"}:
+            try:
+                import ast
+            except Exception:
+                return code
+
+            try:
+                tree = ast.parse(code)
+                func = tree.body[0] if tree.body else None
+                if not isinstance(func, ast.FunctionDef):
+                    return code
+
+                args = ", ".join(f"auto {a.arg}" for a in func.args.args)
+                body_lines = []
+                for node in func.body:
+                    if isinstance(node, ast.Return):
+                        expr = ast.unparse(node.value) if hasattr(ast, "unparse") else ""
+                        body_lines.append(f"return {expr};")
+                body = "\n    ".join(body_lines) if body_lines else ""
+
+                if target_lang == "cpp":
+                    return f"auto {func.name}({args}) {{\n    {body}\n}}"
+                elif target_lang == "java":
+                    return f"public static Object {func.name}({args}) {{\n    {body}\n}}"
+                elif target_lang == "javascript":
+                    return f"function {func.name}({', '.join(a.arg for a in func.args.args)}) {{\n    {body}\n}}"
+            except Exception as e:
+                logger.debug(f"Transpilation failed: {e}")
+                return code
+
+        return code
     
     def create_language_variants(self) -> List[UnifiedSchema]:
         """Create additional language variants for coding problems"""
         logger.info("Creating language variants...")
-        
-        variants = []
-        
+
+        variants: List[UnifiedSchema] = []
+
         for entry in tqdm(self.consolidated_data, desc="Creating variants"):
             if entry.question_type == 'coding' and entry.solution_code:
-                # Create variants for different languages
                 for target_lang in ['python', 'java', 'cpp', 'javascript']:
                     if target_lang not in entry.language.lower():
+                        transpiled = self._transpile_code(
+                            entry.solution_code, entry.language.lower(), target_lang
+                        )
                         variant = UnifiedSchema(
                             question_text=entry.question_text,
                             answer_text=entry.answer_text,
-                            solution_code=entry.solution_code,  # Keep original for now
+                            solution_code=transpiled,
                             language=target_lang,
                             question_type=entry.question_type,
                             source_site=entry.source_site,
@@ -742,7 +833,7 @@ class DatasetConsolidator:
                             test_cases=entry.test_cases.copy() if entry.test_cases else []
                         )
                         variants.append(variant)
-        
+
         self.consolidated_data.extend(variants)
         logger.info(f"Created {len(variants)} language variants")
         return self.consolidated_data
